@@ -8,8 +8,6 @@ import (
 	"github.com/stewelarend/logger"
 )
 
-var log = logger.New()
-
 type Config struct {
 	NrWorkers int `json:"nr_workers"`
 }
@@ -21,145 +19,177 @@ func (config Config) Validate() error {
 	return nil
 }
 
-type controller struct {
-	config          Config
-	freeTasks       chan int //store task ID 0,1,2,...NrWorkers-1
-	freeWorkers     chan *worker
-	workers         []*worker
-	partitionMutex  sync.Mutex
-	partitionWorker map[string]*worker //map[<partitionKey>]<worker index>
-}
-
 type task struct {
 	id           int //0,1,2,...NrWorkers-1
 	partitionKey string
 	eventData    []byte
 }
 
+type doneTask struct {
+	id     int //0,1,2,...
+	worker *worker
+}
+
 func Run(config Config, eventStream IEventStream, eventHandler IEventHandler) (err error) {
-	c := controller{
-		config: config,
+	log := logger.New()
+
+	//create free tasks to limit concurrency
+	//an event is only taken from the stream when we have one of these available
+	freeTasks := make(chan int, config.NrWorkers)
+	for i := 0; i < config.NrWorkers; i++ {
+		freeTasks <- i
 	}
+	log.Debugf("Created %d tasks", config.NrWorkers)
 
-	//prepare tasks and workers
-	//+1 workers because task is put back in free list before worker goes idle
-	//so there must be one more worker than there are tasks, although a task is
-	//needed to start processing, so all N+1 workers won't be used at any point
-	//in time, it just ensures we do not dead-lock having a task but still waiting
-	//for that worker to go idle at the same time that the worker holds the lock
-	//to release it's partition keys...
-	c.freeTasks = make(chan int, config.NrWorkers)
-	c.freeWorkers = make(chan *worker, config.NrWorkers+1)
-	c.workers = make([]*worker, config.NrWorkers+1)
-	c.partitionWorker = map[string]*worker{}
+	//channel for completed tasks
+	//workers put tasks back into this chan then we make them free again
+	doneTasks := make(chan int, config.NrWorkers)
 
-	for i := 0; i <= c.config.NrWorkers; i++ { //notice the <= to create NrWorkers+1!!! Not a mistake, do not change it :-)
-		//worker.taskChan must worst case be as big as the nr of workers
-		//because we can grab that nr of messages with same partition key meaning
-		//one worker will get them all
-		w := &worker{
-			c:             &c,
-			id:            i,
-			handler:       eventHandler,
-			taskChan:      make(chan task, c.config.NrWorkers),
-			partitionKeys: map[string]bool{},
+	//lookup for existing partition workers to ensure events with the
+	//same partition!="" goes to the same worker or a new worker after
+	//the previous partition worker terminated, which is fine as well
+	//because it keeps the event processing in serie for a partition
+	workerMutex := sync.Mutex{}
+	partitionWorker := map[string]*worker{}
+
+	//chan for workers that terminated to clean up the partition if they
+	//are the last worker created for that partition
+	terminatedChan := make(chan *worker)
+	go func() {
+		for w := range terminatedChan {
+			//check if this was the last worker on partition then clear partition
+			workerMutex.Lock()
+			if partitionWorker[w.partition] == w {
+				delete(partitionWorker, w.partition)
+			}
+			workerMutex.Unlock()
 		}
-		c.workers[i] = w
-
-		//run the worker on that chan until the channel is closed
-		//(the worker will put itself in the freeWorkerChan)
-		go w.run()
-
-	}
-	log.Debugf("Created %d workers", c.config.NrWorkers)
-
-	//create NrWorker tasks
-	for i := 0; i < c.config.NrWorkers; i++ {
-		c.freeTasks <- i
-	}
+	}()
 
 	//start of main loop
+	workerGroup := sync.WaitGroup{}
 	for {
-		//get a task token to limit concurrency...
-		//this is a blocking call until we get a token
-		//and this token is put back by the worker when it completed the task
-		//there is one task per worker, but multiple tasks can be sent to the same worker,
-		//based on the partition key to serialise related tasks, in which case
-		//some workers will have multiple tasks queued and others will remain idle
-		log.Debugf("waiting for free task... (freeTasks:%d, freeWorkers:%d)", len(c.freeTasks), len(c.freeWorkers))
-		taskID := <-c.freeTasks
-		log.Debugf("got free task[%d]", taskID)
+		//need a task token to limit concurrency...
+		//while waiting, also handle completed tasks to put them back in the free list
+		taskID := -1
+		for taskID < 0 {
+			select {
+			case doneTaskID := <-doneTasks:
+				freeTasks <- doneTaskID
+			case taskID = <-freeTasks:
+				log.Debugf("got task")
+			}
+		}
 
+		//got a free task token, it is later put into completedTask by the worker
 		//get the next event from the stream
 		//this again is a blocking call until an event is received
-		//an error is returned only when the stream broke and it will
-		//end the run
-		eventData, partitionKey, err := eventStream.NextEvent(0) //0=block indefinitely
-		if err != nil {
-			//cannot get another event
+		//an error is returned only when the stream broke and it will end the run
+		//at the same time, also handle completed tasks
+		event := Event{Data: nil, PartitionKey: "", Error: nil}
+		for event.Data == nil && event.Error == nil {
+			select {
+			case doneTaskID := <-doneTasks:
+				freeTasks <- doneTaskID
+			case event = <-eventStream.EventChan():
+				log.Debugf("event: %+v", event)
+			}
+		}
+
+		if event.Error != nil {
+			//cannot get another event, e.g. end of stream
 			//put token back and terminate with an error
-			c.freeTasks <- taskID
-			err = fmt.Errorf("eventStream broke: %v", err)
+			freeTasks <- taskID
+			err = fmt.Errorf("eventStream broke: %v", event.Error)
 			break
 		}
 
 		//got an event to process
-		//see if partitionKey is already assigned to a worker else assign next free worker
-		c.partitionMutex.Lock()
-		var worker *worker
-		ok := false
-		if partitionKey != "" {
-			worker, ok = c.partitionWorker[partitionKey]
+		//select existing or new partition
+		//note all blank partition == "" has a unique concurrent partition, not serialised
+		workerMutex.Lock()
+		var w *worker
+		if event.PartitionKey != "" {
+			w, _ = partitionWorker[event.PartitionKey]
 		}
-		if !ok {
-			//no worker yet on this partition key, select a free worker
-			//since we have a task token, there should always be a free worker, no blocking
-			worker = <-c.freeWorkers
-			if partitionKey != "" {
-				c.partitionWorker[partitionKey] = worker
+		if w == nil {
+			//create a new worker
+			w = &worker{
+				partition: event.PartitionKey,
+				log:       log.With("partition", event.PartitionKey),
+				handler:   eventHandler,
+				taskChan:  make(chan task, config.NrWorkers),
 			}
-		}
-		log.Debugf("Sending task[%d].partition(%s)->worker[%d]...", taskID, partitionKey, worker.id)
-		worker.taskChan <- task{id: taskID, eventData: eventData, partitionKey: partitionKey}
-		c.partitionMutex.Unlock()
-		log.Debugf("Sent task[%d].partition(%s)->worker[%d] (now %d in workerTaskChan)", taskID, partitionKey, worker.id, len(worker.taskChan))
+			w.taskChan <- task{id: taskID, eventData: event.Data, partitionKey: event.PartitionKey}
 
-		//note: taskToken is not released here, because the worker will put
-		//it back when it completed processing the task
+			if event.PartitionKey != "" {
+				partitionWorker[event.PartitionKey] = w
+				log.Debugf("created partition worker, now %d partitions", len(partitionWorker))
+			} else {
+				log.Debugf("created once-off worker")
+				close(w.taskChan) //once-off only process one task then terminate
+			}
+			//start the new worker
+			workerGroup.Add(1)
+			go func(w *worker) {
+				w.run(doneTasks, terminatedChan)
+				workerGroup.Done()
+			}(w)
+		} else {
+			//existing partition worker
+			w.taskChan <- task{id: taskID, eventData: event.Data, partitionKey: event.PartitionKey}
+		}
+		workerMutex.Unlock()
 	} //for main loop
 
 	//out of main loop
 	//close taskChan in each worker, which will make the worker complete what its
 	//doing then terminate
-	log.Debugf("shutdown: closing worker task channels...")
-	for i := 0; i < c.config.NrWorkers; i++ {
-		close(c.workers[i].taskChan)
+	log.Debugf("shutdown: closing all remaining partition workers...")
+	workerMutex.Lock()
+	for _, w := range partitionWorker {
+		close(w.taskChan)
 	}
+	workerMutex.Unlock()
 
-	//take all the tasks from the task channel
+	//take all the tasks from the task channel or any new ones in done chan
 	//they will be returned as the workers terminate
-	log.Debugf("shutdown: withdrawing %d tasks...", c.config.NrWorkers)
-	remain := c.config.NrWorkers
+	log.Debugf("shutdown: withdrawing %d tasks...", config.NrWorkers)
+	remain := config.NrWorkers
 	lastReport := time.Now()
 	for remain > 0 {
 		//to help debug stuck tasks, put a timeout on getting tasks
 		//and log remaining workers when excessive time is spent
 		select {
-		case <-c.freeTasks:
+		case doneTaskID := <-doneTasks:
 			remain--
+			log.Debugf("recovered task[%d], %d remain", doneTaskID, remain)
+		case taskID := <-freeTasks:
+			remain--
+			log.Debugf("recovered task[%d], %d remain", taskID, remain)
 		case <-time.After(time.Second):
-			log.Debugf("Waiting for %d tasks in %d partitions to complete ...", remain, len(c.partitionWorker))
+			log.Debugf("Waiting for %d tasks in %d partitions to complete ...", remain, len(partitionWorker))
 		}
 
 		if remain > 0 && lastReport.Add(time.Second*10).Before(time.Now()) {
-			//waited 10 second without any tasks completing
-			log.Debugf("Waiting for %d tasks in %d partitions to complete ...", remain, len(c.partitionWorker))
-			for partitionKey, worker := range c.partitionWorker {
-				log.Debugf("  partitionKey(%s).worker[%d] still has %d events to process ...", partitionKey, worker.id, len(worker.taskChan))
+			//waited 10 seconds ... log report
+			log.Debugf("Waiting for %d tasks in %d partitions to complete ...", remain, len(partitionWorker))
+			for partition, w := range partitionWorker {
+				log.Debugf("  partition(%s) still has %d events to process ...", partition, len(w.taskChan))
 			}
 			lastReport = time.Now()
 		}
 	}
+
+	//finally wait for all workers to terminate
+	//this should be quick as they already returned their tasks
+	//and this just wait for them to realise the taskChan is closed
+	//and the controller to get all the terminatedChan events
+	log.Debugf("waiting for workers")
+	workerGroup.Wait()
+	close(terminatedChan)
+	close(doneTasks)
+	close(freeTasks)
 
 	//now ready to terminate
 	log.Debugf("shutdown: done")
